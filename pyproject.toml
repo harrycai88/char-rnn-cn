@@ -1,0 +1,14 @@
+[project]
+name = "char-rnn-cn"
+version = "0.1.0"
+description = "基于 char-rnn 的中文胡言乱语生成器（PyTorch 重写）"
+requires-python = ">=3.10"
+dependencies = ["torch", "numpy"]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
