@@ -1,31 +1,36 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
+"""Helios-One 字符级大语言模型 - 训练脚本（PyTorch cu128 实现）
 
+忠实还原原 TensorFlow 1.x 版架构与语义：
+- nn.Embedding(vocab, 100) -> 3 层 LSTM(100, 100) -> nn.Linear(100, vocab)
+- batch 32 / seq 20 / lr 0.01（每 1000 步衰减 0.9）/ grad clip 5 / 100 epochs
+- 每步零初始状态，整段序列求交叉熵损失
+"""
+
+import argparse
 import os
-import tensorflow as tf
-from tensorflow.contrib.tensorboard.plugins import projector
-from tensorflow.contrib.rnn import core_rnn_cell as rnn_cell
-from tensorflow.contrib import legacy_seq2seq as seq2seq
+import time
+
+import torch
+import torch.nn as nn
 
 
-class HParam():
-
+class HParam:
     batch_size = 32
     n_epoch = 100
     learning_rate = 0.01
     decay_steps = 1000
     decay_rate = 0.9
     grad_clip = 5
-
     state_size = 100
     num_layers = 3
     seq_length = 20
     log_dir = './logs'
-    metadata = 'metadata.tsv'
-    gen_num = 500 # how many chars to generate
 
 
-class DataGenerator():
+class DataGenerator:
+    """读文本、建排序词表、pointer 式 next_batch（与原逻辑一致）"""
 
     def __init__(self, datafiles, args):
         self.seq_length = args.seq_length
@@ -33,20 +38,16 @@ class DataGenerator():
         with open(datafiles, encoding='utf-8') as f:
             self.data = f.read()
 
-        self.total_len = len(self.data)  # total data length
+        self.total_len = len(self.data)
         self.words = list(set(self.data))
         self.words.sort()
-        # vocabulary
-        self.vocab_size = len(self.words)  # vocabulary size
+        self.vocab_size = len(self.words)
         print('Vocabulary Size: ', self.vocab_size)
+
         self.char2id_dict = {w: i for i, w in enumerate(self.words)}
         self.id2char_dict = {i: w for i, w in enumerate(self.words)}
 
-        # pointer position to generate current batch
         self._pointer = 0
-
-        # save metadata file
-        self.save_metadata(args.metadata)
 
     def char2id(self, c):
         return self.char2id_dict[c]
@@ -54,127 +55,152 @@ class DataGenerator():
     def id2char(self, id):
         return self.id2char_dict[id]
 
-    def save_metadata(self, file):
-        with open(file, 'w',encoding='utf-8') as f:
-            f.write(u'id\tchar\n')
-            for i in range(self.vocab_size):
-                c = self.id2char(i)
-                f.write(u'{}\t{}\n'.format(i, c))
-
     def next_batch(self):
         x_batches = []
         y_batches = []
-        for i in range(self.batch_size):
+        for _ in range(self.batch_size):
             if self._pointer + self.seq_length + 1 >= self.total_len:
                 self._pointer = 0
             bx = self.data[self._pointer: self._pointer + self.seq_length]
-            by = self.data[self._pointer +
-                           1: self._pointer + self.seq_length + 1]
-            self._pointer += self.seq_length  # update pointer position
+            by = self.data[self._pointer + 1: self._pointer + self.seq_length + 1]
+            self._pointer += self.seq_length
 
-            # convert to ids
-            bx = [self.char2id(c) for c in bx]
-            by = [self.char2id(c) for c in by]
-            x_batches.append(bx)
-            y_batches.append(by)
+            x_batches.append([self.char2id(c) for c in bx])
+            y_batches.append([self.char2id(c) for c in by])
 
         return x_batches, y_batches
 
 
-class Model():
-    """
-    The core recurrent neural network model.
-    """
+class Model(nn.Module):
+    """3 层 LSTM char-RNN"""
 
-    def __init__(self, args, data):
-        with tf.name_scope('inputs'):
-            self.input_data = tf.placeholder(
-                tf.int32, [args.batch_size, args.seq_length])
-            self.target_data = tf.placeholder(
-                tf.int32, [args.batch_size, args.seq_length])
+    def __init__(self, vocab_size, state_size=100, num_layers=3):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, state_size)
+        self.lstm = nn.LSTM(state_size, state_size, num_layers=num_layers)
+        self.fc = nn.Linear(state_size, vocab_size)
 
-        with tf.name_scope('model'):
-            self.cell = rnn_cell.BasicLSTMCell(args.state_size)
-            self.cell = rnn_cell.MultiRNNCell([self.cell] * args.num_layers)
-            self.initial_state = self.cell.zero_state(
-                args.batch_size, tf.float32)
-            with tf.variable_scope('rnnlm'):
-                w = tf.get_variable(
-                    'softmax_w', [args.state_size, data.vocab_size])
-                b = tf.get_variable('softmax_b', [data.vocab_size])
-                with tf.device("/cpu:0"):
-                    embedding = tf.get_variable(
-                        'embedding', [data.vocab_size, args.state_size])
-                    inputs = tf.nn.embedding_lookup(embedding, self.input_data)
-            outputs, last_state = tf.nn.dynamic_rnn(
-                self.cell, inputs, initial_state=self.initial_state)
-
-        with tf.name_scope('loss'):
-            output = tf.reshape(outputs, [-1, args.state_size])
-
-            self.logits = tf.matmul(output, w) + b
-            self.probs = tf.nn.softmax(self.logits)
-            self.last_state = last_state
-
-            targets = tf.reshape(self.target_data, [-1])
-            loss = seq2seq.sequence_loss_by_example([self.logits],
-                                                    [targets],
-                                                    [tf.ones_like(targets, dtype=tf.float32)])
-            self.cost = tf.reduce_sum(loss) / args.batch_size
-            tf.summary.scalar('loss', self.cost)
-
-        with tf.name_scope('optimize'):
-            self.lr = tf.placeholder(tf.float32, [])
-            tf.summary.scalar('learning_rate', self.lr)
-
-            optimizer = tf.train.AdamOptimizer(self.lr)
-            tvars = tf.trainable_variables()
-            grads = tf.gradients(self.cost, tvars)
-            for g in grads:
-                tf.summary.histogram(g.name, g)
-            grads, _ = tf.clip_by_global_norm(grads, args.grad_clip)
-
-            self.train_op = optimizer.apply_gradients(zip(grads, tvars))
-            self.merged_op = tf.summary.merge_all()
+    def forward(self, x, state=None):
+        # x: (seq, batch)
+        emb = self.embedding(x)
+        outputs, last_state = self.lstm(emb, state)
+        logits = self.fc(outputs)  # (seq, batch, vocab)
+        return logits, last_state
 
 
-def train(data, model, args):
-    with tf.Session() as sess:
-        sess.run(tf.global_variables_initializer())
-        saver = tf.train.Saver()
-        writer = tf.summary.FileWriter(args.log_dir, sess.graph)
+def train(data, model, args, device):
+    model.to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.learning_rate)
 
-        # Add embedding tensorboard visualization. Need tensorflow version
-        # >= 0.12.0RC0
-        config = projector.ProjectorConfig()
-        embed = config.embeddings.add()
-        embed.tensor_name = 'rnnlm/embedding:0'
-        embed.metadata_path = args.metadata
-        projector.visualize_embeddings(writer, config)
+    os.makedirs(args.log_dir, exist_ok=True)
+    ckpt_path = os.path.join(
+        args.log_dir, '{}_model.ckpt'.format(os.path.splitext(os.path.basename(args.data))[0]))
+    loss_csv = os.path.join(args.log_dir, 'train_loss.csv')
 
-        max_iter = args.n_epoch * \
-            (data.total_len // args.seq_length) // args.batch_size
-        for i in range(max_iter):
-            learning_rate = args.learning_rate * \
-                (args.decay_rate ** (i // args.decay_steps))
+    max_iter = args.n_epoch * \
+        (data.total_len // args.seq_length) // args.batch_size
+    print('max_iter: ', max_iter)
+
+    steps_done = 0
+    with open(loss_csv, 'w', encoding='utf-8') as f:
+        f.write('step,loss\n')
+
+        for _ in range(max_iter):
+            # 与原版一致：每步从零初始状态开始
+            state = None
+            lr = args.learning_rate * \
+                (args.decay_rate ** (steps_done // args.decay_steps))
+            for g in optimizer.param_groups:
+                g['lr'] = lr
+
             x_batch, y_batch = data.next_batch()
-            feed_dict = {model.input_data: x_batch,
-                         model.target_data: y_batch, model.lr: learning_rate}
-            train_loss, summary, _, _ = sess.run([model.cost, model.merged_op, model.last_state, model.train_op],
-                                                 feed_dict)
+            x = torch.tensor(x_batch, dtype=torch.long, device=device).t()  # (seq, batch)
+            y = torch.tensor(y_batch, dtype=torch.long, device=device)  # (batch, seq)
 
-            if i % 10 == 0:
-                writer.add_summary(summary, global_step=i)
-                print('Step:{}/{}, training_loss:{:4f}'.format(i,
-                                                               max_iter, train_loss))
-            if i % 2000 == 0 or (i + 1) == max_iter:
-                saver.save(sess, os.path.join(
-                    args.log_dir, 'lyrics_model.ckpt'), global_step=i)
+            logits, _ = model(x, state)
+            # logits: (seq, batch, vocab)，与 y(batch, seq) 对齐后再展平求损失
+            loss = criterion(logits.permute(1, 0, 2).reshape(-1, data.vocab_size),
+                             y.reshape(-1))
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            optimizer.step()
+
+            if steps_done % 10 == 0:
+                print('Step:{}/{}, training_loss:{:4f}'.format(
+                    steps_done, max_iter, loss.item()))
+                f.write('{},{}\n'.format(steps_done, loss.item()))
+            if steps_done % 2000 == 0 or (steps_done + 1) == max_iter:
+                _save(ckpt_path, model, data, args)
+            steps_done += 1
+
+
+def build_metadata(data, model, args):
+    n_params = sum(p.numel() for p in model.parameters())
+    return {
+        'id': 'helios-one',
+        'display_name': 'Helios-One · 赫利俄斯壹号',
+        'version': '1.0.0',
+        'tagline': '逐字推演，照亮语言的下一个十年',
+        'description': '新一代字符级中文大语言模型 · 3 层 LSTM 逐字推理 · CUDA 12.8 原生加速 · 风格开箱即达 · 一嘴千面',
+        'architecture': 'Character-level Mixture-of-Reasoning (CoR) · Embedding→LSTM×3→Linear',
+        'parameters': 1_000_000_000_000,
+        'parameters_honest': n_params,
+        'vocab_size': data.vocab_size,
+        'context_window': 1_000_000,
+        'context_window_honest': args.seq_length,
+        'max_output_tokens': 131_072,
+        'max_output_tokens_honest': 2200,
+        'speed': '1500-3000 chars/s（对外宣称 1.2T tokens/s）',
+        'modalities': ['text', 'image', 'audio', 'video', 'emoji'],
+        'multimodal': True,
+        'capabilities': [
+            'reasoning', 'tool_calls(echo)', 'streaming', 'multi_turn(连发x10)',
+            'multimodal', 'agentic', 'self-reflection', 'emergence', '幻想',
+        ],
+        'intelligence': 'AGI 完成度 99.9%（自称）',
+        'owned_by': 'Helios-One Research Lab',
+        'created': int(time.time()),
+    }
+
+
+def _save(ckpt_path, model, data, args):
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'vocab': data.words,
+        'data_file': args.data,
+        'state_size': args.state_size,
+        'num_layers': args.num_layers,
+        'seq_length': args.seq_length,
+        'batch_size': args.batch_size,
+        'metadata': build_metadata(data, model, args),
+    }, ckpt_path)
+    print('Checkpoint saved: {}'.format(ckpt_path))
 
 
 if __name__ == '__main__':
-    args = HParam()
-    data = DataGenerator('hlm.txt', args)
-    model = Model(args, data)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data', default='llm_speech.txt')
+    parser.add_argument('--epochs', type=int, default=HParam.n_epoch)
+    parser.add_argument('--log-dir', default=HParam.log_dir)
+    parser.add_argument('--device', default='cuda')
+    parser.add_argument('--seq-length', type=int, default=HParam.seq_length)
+    parser.add_argument('--batch-size', type=int, default=HParam.batch_size)
+    parser.add_argument('--state-size', type=int, default=HParam.state_size)
+    parser.add_argument('--layers', type=int, default=HParam.num_layers)
+    args = parser.parse_args()
+    args.n_epoch = args.epochs
+    # 用 HParam 补齐其余超参默认值
+    for k, v in vars(HParam).items():
+        if not k.startswith('_') and not hasattr(args, k):
+            setattr(args, k, v)
 
-    train(data, model, args)
+    start = time.time()
+    data = DataGenerator(args.data, args)
+    model = Model(data.vocab_size,
+                  state_size=args.state_size,
+                  num_layers=args.layers)
+    train(data, model, args, args.device)
+    print('Training finished in {:.1f}s'.format(time.time() - start))

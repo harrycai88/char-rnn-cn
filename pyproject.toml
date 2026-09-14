@@ -1,0 +1,25 @@
+[project]
+name = "helios-one"
+version = "0.1.0"
+description = "Helios-One · 新一代字符级中文大语言模型（PyTorch cu128 实现）"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "numpy",
+    "customtkinter>=6.0.0",
+    "fastapi>=0.141.1",
+    "uvicorn[standard]>=0.52.4",
+    "openai>=3.13.0",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+url = "https://mirrors.aliyun.com/pypi/simple"
+default = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
