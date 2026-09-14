@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-"""char-rnn 中文胡言乱语生成器 - 生成脚本（PyTorch 重写）"""
+"""Helios-One 字符级大语言模型 - 生成脚本（PyTorch cu128 实现）"""
 
 import argparse
 import glob

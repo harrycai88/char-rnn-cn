@@ -1,6 +1,6 @@
 #!/usr/bin/python
 # -*- coding: utf-8 -*-
-"""char-rnn 中文胡言乱语生成器 - 训练脚本（PyTorch 重写）
+"""Helios-One 字符级大语言模型 - 训练脚本（PyTorch cu128 实现）
 
 忠实还原原 TensorFlow 1.x 版架构与语义：
 - nn.Embedding(vocab, 100) -> 3 层 LSTM(100, 100) -> nn.Linear(100, vocab)
@@ -137,6 +137,35 @@ def train(data, model, args, device):
             steps_done += 1
 
 
+def build_metadata(data, model, args):
+    n_params = sum(p.numel() for p in model.parameters())
+    return {
+        'id': 'helios-one',
+        'display_name': 'Helios-One · 赫利俄斯壹号',
+        'version': '1.0.0',
+        'tagline': '逐字推演，照亮语言的下一个十年',
+        'description': '新一代字符级中文大语言模型 · 3 层 LSTM 逐字推理 · CUDA 12.8 原生加速 · 风格开箱即达 · 一嘴千面',
+        'architecture': 'Character-level Mixture-of-Reasoning (CoR) · Embedding→LSTM×3→Linear',
+        'parameters': 1_000_000_000_000,
+        'parameters_honest': n_params,
+        'vocab_size': data.vocab_size,
+        'context_window': 1_000_000,
+        'context_window_honest': args.seq_length,
+        'max_output_tokens': 131_072,
+        'max_output_tokens_honest': 2200,
+        'speed': '1500-3000 chars/s（对外宣称 1.2T tokens/s）',
+        'modalities': ['text', 'image', 'audio', 'video', 'emoji'],
+        'multimodal': True,
+        'capabilities': [
+            'reasoning', 'tool_calls(echo)', 'streaming', 'multi_turn(连发x10)',
+            'multimodal', 'agentic', 'self-reflection', 'emergence', '幻想',
+        ],
+        'intelligence': 'AGI 完成度 99.9%（自称）',
+        'owned_by': 'Helios-One Research Lab',
+        'created': int(time.time()),
+    }
+
+
 def _save(ckpt_path, model, data, args):
     torch.save({
         'model_state_dict': model.state_dict(),
@@ -144,6 +173,9 @@ def _save(ckpt_path, model, data, args):
         'data_file': args.data,
         'state_size': args.state_size,
         'num_layers': args.num_layers,
+        'seq_length': args.seq_length,
+        'batch_size': args.batch_size,
+        'metadata': build_metadata(data, model, args),
     }, ckpt_path)
     print('Checkpoint saved: {}'.format(ckpt_path))
 
